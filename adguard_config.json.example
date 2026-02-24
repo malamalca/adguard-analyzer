@@ -1,0 +1,18 @@
+{
+    "_comment": "AdGuard Analytics config — copy to adguard_config.json and edit as needed.",
+
+    "log": "/path/to/AdGuardHome/data/querylog.json",
+
+    "bg_filter": true,
+
+    "query_filter": "all",
+
+    "gap": 5,
+    "min_queries": 5,
+    "active_rate": 5,
+    "idle_gap": 3,
+
+    "top_n": 10,
+    "exact": false,
+    "show_subdomains": false
+}
