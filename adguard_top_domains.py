@@ -133,10 +133,18 @@ def is_blocked(entry: dict) -> bool:
 
 
 def parse_ts(ts_str: str) -> datetime:
+    """Parse ISO-8601 timestamp that may carry a UTC-offset (+HH:MM).
+
+    Handles both sub-second precision (e.g. '2025-12-20T08:05:52.123456+01:00')
+    and whole-second timestamps (e.g. '2025-12-20T08:05:52+01:00').
+    """
     ts_str = ts_str.strip()
     if len(ts_str) > 6 and ts_str[-3] == ":" and ts_str[-6] in ("+", "-"):
         ts_str = ts_str[:-3] + ts_str[-2:]
-    return datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%S.%f%z")
+    try:
+        return datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%S.%f%z")
+    except ValueError:
+        return datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%S%z")
 
 
 def root_domain(hostname: str) -> str:
