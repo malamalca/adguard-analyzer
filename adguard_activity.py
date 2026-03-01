@@ -10,6 +10,7 @@ import re
 import sys
 import argparse
 import os
+import math
 from datetime import datetime, timedelta, timezone, date
 
 
@@ -305,12 +306,14 @@ def find_active_subblocks(
     events: list[datetime],
     min_rate: int = DEFAULT_ACTIVE_RATE,
     idle_gap: int = DEFAULT_IDLE_GAP,
+    bin_minutes: int = 1,
 ) -> list[tuple]:
     """Within a sorted list of event timestamps, identify 'active' sub-periods
-    based on per-minute query rate.
+    based on per-bin query rate.
 
-    A 1-minute bin is 'hot' when it contains >= min_rate queries.
-    Hot bins separated by at most idle_gap consecutive cold bins are merged into
+    A bin of bin_minutes width is 'hot' when it contains >= min_rate * bin_minutes
+    queries (i.e. the average rate in the bin meets the threshold).
+    Hot bins separated by at most idle_gap minutes of cold bins are merged into
     one active sub-block.
 
     Returns list of (start, end, total_queries, peak_rate_per_min).
@@ -319,12 +322,21 @@ def find_active_subblocks(
         return []
 
     origin: datetime = events[0].replace(second=0, microsecond=0)
+    # round origin down to nearest bin_minutes boundary
+    origin = origin - timedelta(minutes=origin.minute % bin_minutes,
+                                seconds=origin.second,
+                                microseconds=origin.microsecond)
 
-    # Count queries per 1-minute bin
+    # Count queries per bin
     bin_counts: dict[int, int] = {}
     for ts in events:
-        idx = int((ts - origin).total_seconds() / 60)
+        idx = int((ts - origin).total_seconds() / 60 / bin_minutes)
         bin_counts[idx] = bin_counts.get(idx, 0) + 1
+
+    # Threshold: queries per bin that equals min_rate q/min
+    hot_threshold = min_rate * bin_minutes
+    # idle_gap in minutes → how many consecutive cold bins close a sub-block
+    idle_bins = max(1, math.ceil(idle_gap / bin_minutes))
 
     max_idx = max(bin_counts)
     subblocks: list[tuple] = []
@@ -333,7 +345,7 @@ def find_active_subblocks(
     cold_run: int           = 0
 
     for i in range(max_idx + 1):
-        is_hot = bin_counts.get(i, 0) >= min_rate
+        is_hot = bin_counts.get(i, 0) >= hot_threshold
         if is_hot:
             if active_start is None:
                 active_start = i
@@ -342,24 +354,24 @@ def find_active_subblocks(
         else:
             if active_start is not None:
                 cold_run += 1
-                if cold_run > idle_gap:
+                if cold_run > idle_bins:
                     # Close sub-block at last_hot
-                    s = origin + timedelta(minutes=active_start)
-                    e = origin + timedelta(minutes=last_hot + 1)
+                    s = origin + timedelta(minutes=active_start * bin_minutes)
+                    e = origin + timedelta(minutes=(last_hot + 1) * bin_minutes)
                     q = sum(bin_counts.get(j, 0) for j in range(active_start, last_hot + 1))
                     p = max(bin_counts.get(j, 0) for j in range(active_start, last_hot + 1))
-                    subblocks.append((s, e, q, p))
+                    subblocks.append((s, e, q, p * (1 / bin_minutes)))  # peak as q/min
                     active_start = None
                     last_hot     = None
                     cold_run     = 0
 
     # Close any open sub-block
     if active_start is not None and last_hot is not None:
-        s = origin + timedelta(minutes=active_start)
-        e = origin + timedelta(minutes=last_hot + 1)
+        s = origin + timedelta(minutes=active_start * bin_minutes)
+        e = origin + timedelta(minutes=(last_hot + 1) * bin_minutes)
         q = sum(bin_counts.get(j, 0) for j in range(active_start, last_hot + 1))
         p = max(bin_counts.get(j, 0) for j in range(active_start, last_hot + 1))
-        subblocks.append((s, e, q, p))
+        subblocks.append((s, e, q, p * (1 / bin_minutes)))
 
     return subblocks
 
@@ -375,7 +387,8 @@ def _print_activity_breakdown(
 ):
     """Print active/idle sub-periods for one domain block."""
     print(f"\n    Activity breakdown  "
-          f"(\u2265{min_rate} queries/min = active, idle gap \u2264{idle_gap} min):")
+          f"(\u2265{min_rate} queries/min = active, idle gap \u2264{idle_gap} min "
+          f"[≡ chart bins]):")
 
     if not subblocks:
         print(f"      No active periods detected "
@@ -412,7 +425,7 @@ def _print_activity_breakdown(
               f"{sub_end.strftime('%H:%M')}  "
               f"{fmt_duration(dur_s)}  "
               f"{queries} queries  "
-              f"avg {avg_r:.1f}/min  peak {peak}/min")
+              f"avg {avg_r:.1f}/min  peak {peak:.0f}/min")
         cursor = sub_end
 
     # Trailing idle
@@ -448,6 +461,183 @@ def _print_filter_summary(bg_filtered: int, dropped_blocks, min_queries: int, bg
                   f"({count} quer{'y' if count == 1 else 'ies'})")
 
 
+_C_KEPT    = "\033[32m"   # green        – below-threshold portion in a kept block
+_C_DROPPED = "\033[33m"   # yellow       – below-threshold portion in a dropped block
+_C_HOT     = "\033[91m"   # bright red   – bar portion above active_rate threshold
+_C_DIM     = "\033[2m"    # dim/grey     – bar portion with no block membership
+_C_RESET   = "\033[0m"    # reset
+
+
+def _supports_color() -> bool:
+    """Return True when the terminal is likely to render ANSI colors."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR") or os.environ.get("COLORTERM"):
+        return True
+    term = os.environ.get("TERM", "")
+    if term == "dumb":
+        return False
+    try:
+        return os.isatty(sys.stdout.fileno())
+    except Exception:
+        return False
+
+
+def _color_line(chars: list[str], col_color: list, use_color: bool) -> str:
+    """Join chars, wrapping runs with ANSI color codes when use_color is True."""
+    if not use_color:
+        return "".join(chars)
+    out = []
+    cur = None
+    for ch, color in zip(chars, col_color):
+        effective = color if ch.strip() else None  # don't color spaces
+        if effective != cur:
+            if cur is not None:
+                out.append(_C_RESET)
+            if effective is not None:
+                out.append(effective)
+            cur = effective
+        out.append(ch)
+    if cur is not None:
+        out.append(_C_RESET)
+    return "".join(out)
+
+
+def _print_day_chart(
+    events: list[datetime],
+    target_date: date,
+    gap_minutes: int,
+    blocks: list,
+    dropped_blocks: list,
+    active_rate: int = DEFAULT_ACTIVE_RATE,
+    idle_gap: int = DEFAULT_IDLE_GAP,
+) -> None:
+    """Print an ASCII bar chart of query intensity across the full day.
+
+    X axis: full day 00:00–24:00 divided into gap-aligned bins.
+    Y axis: queries per bin.
+    Bar portions above the active_rate threshold are bright red; portions below
+    are green (kept block), yellow (dropped block), or default (no block).
+    A second row below the X axis marks kept/dropped blocks with ▓/▒.
+    """
+    try:
+        term_cols = os.get_terminal_size().columns
+    except OSError:
+        term_cols = 80
+    term_cols = min(term_cols, 200)
+
+    Y_W    = 7   # chars reserved for Y-axis labels ("   999 │")
+    plot_w = term_cols - Y_W - 1
+    if plot_w < 24:
+        return  # terminal too narrow
+
+    CHART_H = 8  # text rows for the chart body
+
+    # ── bin size: smallest multiple of gap_minutes that fits in plot_w ────────
+    snap   = max(gap_minutes,
+                 math.ceil((1440 / plot_w) / gap_minutes) * gap_minutes)
+    n_bins = math.ceil(1440 / snap)   # guaranteed n_bins <= plot_w
+
+    # ── bucket events ─────────────────────────────────────────────────────────
+    counts = [0] * n_bins
+    for ts in events:
+        midnight = ts.replace(hour=0, minute=0, second=0, microsecond=0)
+        mins     = (ts - midnight).total_seconds() / 60
+        b        = min(int(mins / snap), n_bins - 1)
+        counts[b] += 1
+
+    max_count = max(counts) if any(counts) else 1
+    max_rate  = max_count / snap   # q/min for peak bin
+
+    # ── active_rate threshold: chart row (0-based from bottom) of the boundary
+    threshold_count = active_rate * snap          # queries/bin at threshold
+    threshold_row   = round(threshold_count / max_count * CHART_H)  # rows needed to reach threshold
+    # a filled cell at render-row `row` is above the threshold when row >= threshold_row
+    # (threshold_row >= CHART_H means threshold exceeds peak → no hot cells)
+
+    use_color = _supports_color()
+
+    def _bins_for_block(b_start, b_end):
+        midnight = b_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        c1 = int((b_start - midnight).total_seconds() / 60 / snap)
+        c2 = int((b_end   - midnight).total_seconds() / 60 / snap)
+        return range(max(0, c1), min(n_bins, c2 + 1))
+
+    # ── mark bins inside kept / dropped activity blocks ──────────────────────
+    in_block   = [False] * n_bins
+    in_dropped = [False] * n_bins
+    for b_start, b_end, _ in blocks:
+        for c in _bins_for_block(b_start, b_end):
+            in_block[c] = True
+    for b_start, b_end, _ in dropped_blocks:
+        for c in _bins_for_block(b_start, b_end):
+            if not in_block[c]:   # kept takes priority
+                in_dropped[c] = True
+
+    # per-bin color: green for kept, yellow for dropped, None otherwise
+    col_color = [
+        _C_KEPT    if in_block[c] else
+        _C_DROPPED if in_dropped[c] else
+        None
+        for c in range(n_bins)
+    ]
+
+    # ── header ────────────────────────────────────────────────────────────────
+    sep = "─" * max(0, term_cols - 46)
+    if threshold_count > max_count:
+        threshold_note = " (above peak – no bars reach threshold)"
+    else:
+        threshold_note = ""
+    print(f"\n  ── Daily query chart  "
+          f"bin={snap:.0f} min  "
+          f"peak={max_rate:.1f} q/min  "
+          f"threshold=\u2265{active_rate} q/min  idle gap \u2264{idle_gap} min{threshold_note}  {sep}")
+
+    # ── chart rows ────────────────────────────────────────────────────────────
+    # Map each bin to an integer height in 0..CHART_H rows (no partial glyphs)
+    heights = [round(counts[c] / max_count * CHART_H) for c in range(n_bins)]
+
+    for row in range(CHART_H - 1, -1, -1):
+        if row == CHART_H - 1:
+            ylabel = f"{max_rate:{Y_W - 2}.1f} │"
+        elif row == (CHART_H - 1) // 2:
+            ylabel = f"{max_rate / 2:{Y_W - 2}.1f} │"
+        elif row == 0:
+            ylabel = f"{'0':>{Y_W - 2}} │"
+        else:
+            ylabel = " " * (Y_W - 1) + "│"
+
+        # per-cell color: hot (red) above threshold, else kept/dropped/dim
+        cell_colors = [
+            _C_HOT     if (heights[c] > row and row >= threshold_row) else
+            _C_KEPT    if (heights[c] > row and in_block[c]) else
+            _C_DROPPED if (heights[c] > row and in_dropped[c]) else
+            _C_DIM     if (heights[c] > row) else
+            None
+            for c in range(n_bins)
+        ]
+        chars = ["█" if heights[c] > row else " " for c in range(n_bins)]
+        print(ylabel + _color_line(chars, cell_colors, use_color))
+
+    # ── X axis ────────────────────────────────────────────────────────────────
+    print(" " * (Y_W - 1) + "└" + "─" * n_bins)
+
+    # ── activity block indicator row ──────────────────────────────────────────
+    ind_chars  = ["▓" if in_block[c] else "▒" if in_dropped[c] else "░" for c in range(n_bins)]
+    print(" " * Y_W + _color_line(ind_chars, col_color, use_color))
+
+    # ── hour labels ───────────────────────────────────────────────────────────
+    h_step    = 3 if n_bins >= 48 else 6
+    lbl_chars = [" "] * n_bins
+    for h in range(0, 25, h_step):
+        col = min(int(h * 60 / snap), n_bins - 1)
+        lbl = f"{h:02d}h"
+        for i, ch in enumerate(lbl):
+            if col + i < n_bins:
+                lbl_chars[col + i] = ch
+    print(" " * Y_W + "".join(lbl_chars))
+    print()
+
 def print_report(
     client_ip: str,
     target_date: date,
@@ -478,6 +668,7 @@ def print_report(
         print(f"  Activity  : \u2265{active_rate} queries/min = active,  idle gap \u2264{idle_gap} min")
     print(f"  Gap split : {gap_minutes} minutes of inactivity")
     if not domain:
+        print(f"  Activity  : \u2265{active_rate} queries/min = active,  idle gap \u2264{idle_gap} min")
         if bg_filter:
             print(f"  BG filter : on  (hostname patterns + min {min_queries} queries/block)")
         else:
@@ -523,10 +714,14 @@ def print_report(
     print(f"  Total queries : {total_queries}")
     print(f"  Total active  : {fmt_duration(total_active_seconds)}")
     if active_subblocks is not None and total_active_seconds > 0:
-        idle_s = total_active_seconds - grand_active_s
-        pct    = grand_active_s / total_active_seconds * 100
-        print(f"  Domain active : {fmt_duration(grand_active_s)}  ({pct:.0f}% of session)")
-        print(f"  Domain idle   : {fmt_duration(idle_s)}")
+        idle_s   = total_active_seconds - grand_active_s
+        pct      = grand_active_s / total_active_seconds * 100
+        if domain:
+            print(f"  Domain active : {fmt_duration(grand_active_s)}  ({pct:.0f}% of session)")
+            print(f"  Domain idle   : {fmt_duration(idle_s)}")
+        else:
+            print(f"  Active time   : {fmt_duration(grand_active_s)}  ({pct:.0f}% of session)")
+            print(f"  Idle time     : {fmt_duration(idle_s)}")
     _print_filter_summary(bg_filtered, dropped_blocks, min_queries, bg_filter)
     print("=" * 60)
     print()
@@ -695,18 +890,23 @@ def main():
     )
     blocks, dropped = build_blocks(events, gap, min_queries)
 
-    # In domain mode compute per-block activity sub-blocks
+    # Compute per-block activity sub-blocks (always, not just in domain mode)
     active_subblocks  = None
     block_events_list = None
-    if args.domain and blocks:
+    if blocks:
         active_subblocks  = []
         block_events_list = []
         for (b_start, b_end, _) in blocks:
             be = [ts for ts in events if b_start <= ts <= b_end]
             block_events_list.append(be)
-            active_subblocks.append(
-                find_active_subblocks(be, active_rate, idle_gap)
-            )
+            subs = find_active_subblocks(be, active_rate, idle_gap, bin_minutes=gap)
+            # clamp sub-block times to actual block boundaries (bin rounding may overshoot)
+            subs = [
+                (max(s, b_start), min(e, b_end), q, p)
+                for s, e, q, p in subs
+                if min(e, b_end) > max(s, b_start)   # drop if clamping empties it
+            ]
+            active_subblocks.append(subs)
 
     print_report(
         args.ip, target_date, blocks, dropped, gap,
@@ -718,6 +918,7 @@ def main():
         block_events_list=block_events_list,
         query_filter=query_filter,
     )
+    _print_day_chart(events, target_date, gap, blocks, dropped, active_rate, idle_gap)
 
 
 if __name__ == "__main__":
