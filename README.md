@@ -72,12 +72,12 @@ usage: adguard_activity.py [-h] [--config FILE] [--log FILE] [--gap MINUTES]
 |---|---|---|
 | `--log FILE` | config / required | Path to `querylog.json` |
 | `--config FILE` | auto-detected | Path to a JSON config file |
-| `--gap MINUTES` | `5` | Inactivity gap that starts a new activity block |
+| `--gap MINUTES` | `5` | Inactivity gap (minutes) that starts a new activity block; also sets the chart bin width |
 | `--min-queries N` | `5` | Drop blocks with fewer queries |
 | `--no-bg-filter` | off | Disable background-hostname filtering |
-| `--domain DOMAIN` | — | Restrict to one domain and its subdomains; enables per-minute activity breakdown |
-| `--active-rate N` | `5` | Queries/min threshold for "active" (domain mode) |
-| `--idle-gap MINS` | `3` | Idle minutes tolerated inside an active sub-block |
+| `--domain DOMAIN` | — | Restrict to one domain and its subdomains |
+| `--active-rate N` | `5` | Queries/min threshold for `[ACTIVE]` in the activity breakdown and chart coloring |
+| `--idle-gap MINS` | `3` | Consecutive idle minutes allowed inside an active sub-block before it is closed |
 | `--only-allowed` | — | Count only queries **not** blocked by AdGuard |
 | `--only-blocked` | — | Count only queries **blocked** by AdGuard |
 
@@ -88,28 +88,50 @@ usage: adguard_activity.py [-h] [--config FILE] [--log FILE] [--gap MINUTES]
   AdGuard Activity Report
   Client IP : 192.168.1.10
   Date      : 2026-02-24 (Tuesday)
-  Gap split : 5 minutes of inactivity
+  Gap split : 10 minutes of inactivity
+  Activity  : ≥5 queries/min = active,  idle gap ≤3 min
   BG filter : on  (hostname patterns + min 5 queries/block)
 ============================================================
 
   Block  1
     Start      : 08:14:22  (+0100)
-    End        : 09:47:05
-    Duration   : 1h 32m 43s
-    DNS queries: 312
-
-  Block  2
-    Start      : 14:03:11  (+0100)
     End        : 14:58:44
-    Duration   : 55m 33s
-    DNS queries: 87
+    Duration   : 6h 44m 22s
+    DNS queries: 399
+
+    Activity breakdown  (≥5 queries/min = active, idle gap ≤3 min [≡ chart bins]):
+      [ACTIVE]  08:10 – 09:50  1h 40m 0s  312 queries  avg 3.1/min  peak 18/min
+      [ IDLE ]  09:50 – 14:00  4h 10m 0s  12 queries  avg 0.0/min
+      [ACTIVE]  14:00 – 15:00  1h 0m 0s  87 queries  avg 1.5/min  peak 9/min
+      ────────────────────────────────────────────────
+      Active sub-blocks : 2
+      Active time       : 2h 40m 0s (40% of block)
+      Idle time         : 4h 4m 22s
 
 ------------------------------------------------------------
-  Total blocks  : 2
+  Total blocks  : 1
   Total queries : 399
-  Total active  : 2h 28m 16s
+  Total active  : 6h 44m 22s
+  Active time   : 2h 40m 0s  (40% of session)
+  Idle time     : 4h 4m 22s
 ============================================================
+
+  ── Daily query chart  bin=10 min  peak=18.0 q/min  threshold=≥5 q/min  idle gap ≤3 min
+  18.0 │                 █
+       │                 █                         █
+   9.0 │                 █  █                      █
+       │                 ████ █                █    █
+       │                 ████████              ███████
+     0 │                 █████████             ████████
+       └────────────────────────────────────────────────────
+        ░░░░░░░░░░░░░░░░░▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░▓▓▓▓▓▓▓▓░░░░░
+        00h         06h         12h         18h         24h
 ```
+
+Bars are **green** when the bin is inside a kept block. The top portion of each
+bar turns **red** when the bin's query rate exceeds `--active-rate`. The
+indicator row below the X axis shows `▓` for kept blocks and `░` for inactive
+periods.
 
 ## `adguard_top_domains.py`
 
